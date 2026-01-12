@@ -1,0 +1,30 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class ModulePermission extends Model
+{
+    use HasFactory;
+
+    protected $table = 'module_permission';
+
+    protected $fillable = [
+        'permission_id',
+        'module',
+        'is_create',
+        'is_edit',
+        'is_delete',
+        'is_filter',
+        'is_view',
+        'is_import'
+    ];
+
+
+    public function permission()
+    {
+        return $this->belongsTo(Permission::class, 'permission_id');
+    }
+}

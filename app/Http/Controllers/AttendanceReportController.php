@@ -1,0 +1,113 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Carbon\Carbon;
+use App\Models\PssEmployeeAttendance;
+use App\Models\Employee;
+
+class AttendanceReportController extends Controller
+{
+    public function index(Request $request)
+    {
+        $employee_id = $request->employee_id ?? 'all';
+        $month = $request->month ?? Carbon::now()->format('Y-m');
+
+        // 🔹 Month range
+        $startDate = Carbon::createFromFormat('Y-m', $month)->startOfMonth();
+        $endDate   = Carbon::createFromFormat('Y-m', $month)->endOfMonth();
+
+        $pssemployees = Employee::where('status', 1)
+            ->where('is_deleted', 0)
+            ->where('id', '!=', 1)
+            ->when($employee_id !== 'all', function ($q) use ($employee_id) {
+                $q->where('id', $employee_id);
+            })
+            ->select('id', 'full_name')
+            ->get();
+
+
+        // 🔹 Attendance query
+        $query = PssEmployeeAttendance::with(['employee', 'shift'])
+            ->whereBetween('attendance_date', [$startDate, $endDate]);
+
+        if ($employee_id !== 'all') {
+            $query->where('employee_id', $employee_id);
+        }
+
+        $records = $query
+            ->orderBy('attendance_date')
+            ->orderBy('attendance_time')
+            ->get()
+            ->groupBy('attendance_date');
+
+        $report = [];
+        $presentDays = 0;
+        $absentDays  = 0;
+
+        foreach ($records as $date => $logs) {
+
+            // ✅ get employee from first record
+            $employee = $logs->first()->employee;
+            $shift = $logs->first()->shift;
+
+            $login  = $logs->where('reason', 'login')->first();
+            $logout = $logs->where('reason', 'logout')->last();
+
+            $totalSeconds = 0;
+            $breakSeconds = 0;
+
+
+            $breakIns  = $logs->where('reason', 'breakin')->values();
+            $breakOuts = $logs->where('reason', 'breakout')->values();
+
+            foreach ($breakIns as $index => $breakIn) {
+                if (isset($breakOuts[$index])) {
+                    $breakSeconds += Carbon::parse($breakOuts[$index]->attendance_time)
+                        ->diffInSeconds(Carbon::parse($breakIn->attendance_time));
+                }
+            }
+
+            if ($login && $logout) {
+                $presentDays++;
+
+                $totalSeconds = Carbon::parse($logout->attendance_time)
+                    ->diffInSeconds(Carbon::parse($login->attendance_time));
+
+                $payableSeconds = $totalSeconds - $breakSeconds;
+
+                $status = 'Present';
+            } else {
+                $absentDays++;
+                $status = 'Absent';
+                $payableSeconds = 0;
+            }
+
+            $report[] = [
+                'employee_name' => $employee?->full_name,
+                'employee_id'   => $employee?->gen_employee_id,
+                'shift_name'    => $shift?->shift_name,
+                'date'          => Carbon::parse($date)->format('d/m/Y'),
+                'status'        => $status,
+                'login_time'    => $login?->attendance_time,
+                'logout_time'   => $logout?->attendance_time,
+                'break_time'    => gmdate('H:i:s', $breakSeconds),
+                'total_hours'   => gmdate('H:i:s', $totalSeconds),
+                'payable_time' => gmdate('H:i:s', max($payableSeconds, 0)),
+            ];
+        }
+
+
+        return response()->json([
+            'success' => true,
+            'summary' => [
+                'total_working_days' => $startDate->diffInDays($endDate) + 1,
+                'present_days'       => $presentDays,
+                'absent_days'        => $absentDays,
+            ],
+            'data' => $report,
+            'employees' => $pssemployees
+        ]);
+    }
+}

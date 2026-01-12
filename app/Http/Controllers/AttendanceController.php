@@ -1,0 +1,239 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use App\Models\Attendance;
+
+use App\Models\AttendanceDetails;
+use App\Models\ContractCanEmp;
+use App\Models\Company;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Validator;
+use App\Models\Employee;
+use App\Models\CompanyShifts;
+use Carbon\Carbon;
+
+class AttendanceController extends Controller
+{
+    /**
+     * CREATE ATTENDANCE
+     */
+    public function store(Request $request)
+    {
+
+        // dd($request->all());
+        // $validator = Validator::make($request->all(), [
+        //     'company_name'     => 'required|string',
+        //     'attendance_date'  => 'required|date',
+        //     'employees'        => 'required|array',
+        //     'employees.*.employee_id' => 'required|exists:employees,id',
+        //     'employees.*.attendance'  => 'required|in:0,1'
+        // ]);
+
+        // if ($validator->fails()) {
+        //     return response()->json([
+        //         'success' => false,
+        //         'errors'  => $validator->errors()
+        //     ], 422);
+        // }
+
+        $alreadyExists = Attendance::where('company_id', $request->company_id)
+            ->where('is_deleted', 0)
+            ->whereDate('attendance_date', $request->attendance_date)
+            ->exists();
+
+        if ($alreadyExists) {
+            return response()->json([
+                'success' => false,
+                'errors' => [
+                    'attendance_date' => [
+                        'Attendance for this company on this date already exists.'
+                    ]
+                ]
+            ], 422);
+        }
+
+
+        DB::beginTransaction();
+
+        try {
+            $attendance = Attendance::create([
+                'company_id'    => $request->company_id,
+                'attendance_date' => $request->attendance_date,
+                'created_by'      => $request->created_by,
+            ]);
+
+            foreach ($request->employees as $emp) {
+                AttendanceDetails::create([
+                    'attendance_id' => $attendance->id,
+                    'employee_id'   => $emp['employee_id'], // contract employee id
+                    'attendance'    => $emp['attendance'],
+                    'shift_id'      => $emp['shift_id']
+                ]);
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Contract employee attendance added successfully'
+            ], 201);
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * VIEW ALL ATTENDANCE
+     */
+    public function index(Request $request)
+    {
+        $query = Attendance::with([
+            'company:id,company_name',
+            'company.shifts',
+            'details',
+            'employee'
+        ])->where('is_deleted', 0);
+
+        // Date filter
+        if ($request->filled('from_date') && $request->filled('to_date')) {
+            $from = Carbon::parse($request->from_date)->startOfDay();
+            $to   = Carbon::parse($request->to_date)->endOfDay();
+
+            $query->whereBetween('created_at', [$from, $to]);
+        }
+
+        // Company filter
+        if ($request->filled('company_id')) {
+            $query->where('company_id', $request->company_id);
+        }
+
+        // Created by / Updated by filter (proper grouping)
+        if ($request->filled('created_by')) {
+            $query->where(function ($q) use ($request) {
+                $q->where('created_by', $request->created_by)
+                    ->orWhere('updated_by', $request->created_by);
+            });
+        }
+
+        $data = $query->latest()->get();
+
+        // Companies dropdown
+        $companies = Company::where('status', 1)
+            ->where('is_deleted', 0)
+            ->select('id', 'company_name')
+            ->latest()
+            ->get();
+
+        // Created by dropdown
+        $createdby = Employee::where('status', 1)
+            ->where('is_deleted', 0)
+            ->where('id', '!=', 1)
+            ->select('id', 'full_name')
+            ->latest()
+            ->get();
+
+        return response()->json([
+            'success'   => true,
+            'data'      => $data,
+            'companies' => $companies,
+            'createdby' => $createdby
+        ]);
+    }
+
+    /**
+     * VIEW SINGLE ATTENDANCE
+     */
+    public function show($id)
+    {
+        $attendance = Attendance::with([
+            'company:id,company_name',
+            'details.contractEmployee',
+            'shifts'
+        ])->findOrFail($id);
+
+        $shifts = CompanyShifts::where('parent_id', $attendance->company_id)
+            ->where('is_deleted', 0)
+            ->get();
+
+        return response()->json([
+            'success' => true,
+            'data'    => $attendance,
+            'shifts' => $shifts
+        ]);
+    }
+
+    /**
+     * UPDATE ATTENDANCE
+     */
+    public function update(Request $request, $id)
+    {
+        DB::beginTransaction();
+
+        try {
+            $attendance = Attendance::findOrFail($id);
+
+            $attendance->update([
+                'company_id'    => $request->company_id,
+                'attendance_date' => $request->attendance_date,
+                'updated_by'      => $request->updated_by,
+            ]);
+
+            AttendanceDetails::where('attendance_id', $id)->delete();
+
+            foreach ($request->employees as $emp) {
+                AttendanceDetails::create([
+                    'attendance_id' => $id,
+                    'employee_id'   => $emp['employee_id'],
+                    'attendance'    => $emp['attendance'],
+                    'shift_id'      => $emp['shift_id']
+                ]);
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Contract employee attendance updated successfully'
+            ]);
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * DELETE ATTENDANCE (SOFT DELETE)
+     */
+    public function destroy($id)
+    {
+        Attendance::where('id', $id)->update(['is_deleted' => 1]);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Attendance deleted successfully'
+        ]);
+    }
+
+    public function getCompanyEmployees($company_id)
+    {
+        $employees = ContractCanEmp::where('company_id', $company_id)
+            ->where('status', 1)
+            ->where('is_deleted', 0)
+            ->whereNotNull('joining_date')
+            ->whereDate('joining_date', '<=', Carbon::today())
+            ->get(['id', 'name']);
+
+        $shifts = CompanyShifts::where('parent_id', $company_id)
+            ->where('is_deleted', 0)
+            ->get();
+
+        return response()->json([
+            'success' => true,
+            'data'    => $employees,
+            'shifts'  => $shifts
+        ]);
+    }
+}
